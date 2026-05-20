@@ -3422,7 +3422,7 @@ static void do_brush_action(const Depsgraph &depsgraph,
           brushes::do_enhance_details_brush(depsgraph, sd, ob, node_mask);
         }
         else {
-          brushes::do_smooth_brush(
+          brushes::do_smooth_brush_preserve_form(
               depsgraph, sd, ob, node_mask, std::clamp(ss.cache->bstrength, 0.0f, 1.0f));
         }
       }

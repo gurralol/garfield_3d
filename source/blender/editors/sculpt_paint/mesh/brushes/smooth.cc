@@ -54,6 +54,8 @@ struct LocalData {
   Vector<int> neighbor_offsets;
   Vector<int> neighbor_data;
   Vector<float3> new_positions;
+  Vector<float3> average_positions;
+  Vector<float3> laplacian_disp;
   Vector<float3> translations;
 };
 
@@ -233,6 +235,256 @@ static void calc_bmesh(const Depsgraph &depsgraph,
   apply_translations(translations, verts);
 }
 
+constexpr float preserve_form_alpha = 0.75f;
+constexpr float preserve_form_beta = 0.25f;
+
+BLI_NOINLINE static void do_smooth_brush_preserve_form_mesh(const Depsgraph &depsgraph,
+                                                            const Sculpt &sd,
+                                                            const Brush &brush,
+                                                            Object &object,
+                                                            const IndexMask &node_mask,
+                                                            const float brush_strength)
+{
+  SculptSession &ss = *object.runtime->sculpt_session;
+  bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
+  MutableSpan<bke::pbvh::MeshNode> nodes = pbvh.nodes<bke::pbvh::MeshNode>();
+  Mesh &mesh = *id_cast<Mesh *>(object.data);
+  const OffsetIndices faces = mesh.faces();
+  const Span<int> corner_verts = mesh.corner_verts();
+  const GroupedSpan<int> vert_to_face_map = mesh.vert_to_face_map();
+  const MeshAttributeData attribute_data(mesh);
+
+  const PositionDeformData position_data(depsgraph, object);
+  const Span<float3> vert_normals = bke::pbvh::vert_normals_eval(depsgraph, object);
+
+  Array<int> node_offset_data;
+  const OffsetIndices<int> node_vert_offsets = create_node_vert_offsets(
+      nodes, node_mask, node_offset_data);
+  Array<float> all_factors(node_vert_offsets.total_size());
+  Array<float> all_distances(node_vert_offsets.total_size());
+
+  threading::EnumerableThreadSpecific<LocalData> all_tls;
+  MutableSpan<float3> all_laplacian_disp = ss.cache->surface_smooth_laplacian_disp;
+
+  node_mask.foreach_index(
+      [&](const int i, const int pos) {
+        LocalData &tls = all_tls.local();
+        const Span<int> verts = nodes[i].verts();
+        const MutableSpan<float> node_factors = all_factors.as_mutable_span().slice(
+            node_vert_offsets[pos]);
+        calc_factors_common_mesh_indexed(depsgraph,
+                                         brush,
+                                         object,
+                                         attribute_data,
+                                         position_data.eval,
+                                         vert_normals,
+                                         nodes[i],
+                                         node_factors,
+                                         all_distances.as_mutable_span().slice(
+                                             node_vert_offsets[pos]));
+        scale_factors(node_factors, brush_strength);
+
+        const MutableSpan<float3> positions = gather_data_mesh(position_data.eval, verts, tls.positions);
+        const GroupedSpan<int> neighbors = calc_vert_neighbors_interior(faces,
+                                                                        corner_verts,
+                                                                        vert_to_face_map,
+                                                                        ss.boundary_info_cache->verts,
+                                                                        ss.boundary_info_cache->edges,
+                                                                        attribute_data.hide_poly,
+                                                                        verts,
+                                                                        node_factors,
+                                                                        tls.neighbor_offsets,
+                                                                        tls.neighbor_data);
+
+        tls.average_positions.resize(verts.size());
+        const MutableSpan<float3> average_positions = tls.average_positions;
+        smooth::neighbor_data_average_mesh_check_loose(
+            position_data.eval, verts, neighbors, average_positions);
+
+        const OrigPositionData orig_data = orig_position_data_get_mesh(object, nodes[i]);
+        tls.laplacian_disp.resize(verts.size());
+        const MutableSpan<float3> laplacian_disp = tls.laplacian_disp;
+        tls.translations.resize(verts.size());
+        const MutableSpan<float3> translations = tls.translations;
+        smooth::surface_smooth_laplacian_step(positions,
+                                              orig_data.positions,
+                                              average_positions,
+                                              preserve_form_alpha,
+                                              laplacian_disp,
+                                              translations);
+        scale_translations(translations, node_factors);
+
+        scatter_data_mesh(laplacian_disp.as_span(), verts, all_laplacian_disp);
+
+        clip_and_lock_translations(sd, ss, position_data.eval, verts, translations);
+        position_data.deform(translations, verts);
+      },
+      exec_mode::grain_size(1));
+
+  node_mask.foreach_index(
+      [&](const int i, const int pos) {
+        LocalData &tls = all_tls.local();
+        const Span<int> verts = nodes[i].verts();
+        const Span<float> node_factors = all_factors.as_span().slice(node_vert_offsets[pos]);
+        const MutableSpan<float3> laplacian_disp = gather_data_mesh(
+            all_laplacian_disp.as_span(), verts, tls.laplacian_disp);
+        const GroupedSpan<int> neighbors = calc_vert_neighbors_interior(faces,
+                                                                        corner_verts,
+                                                                        vert_to_face_map,
+                                                                        ss.boundary_info_cache->verts,
+                                                                        ss.boundary_info_cache->edges,
+                                                                        attribute_data.hide_poly,
+                                                                        verts,
+                                                                        node_factors,
+                                                                        tls.neighbor_offsets,
+                                                                        tls.neighbor_data);
+
+        tls.average_positions.resize(verts.size());
+        const MutableSpan<float3> average_laplacian_disps = tls.average_positions;
+        smooth::neighbor_data_average_mesh_check_loose(
+            all_laplacian_disp.as_span(), verts, neighbors, average_laplacian_disps);
+
+        tls.translations.resize(verts.size());
+        const MutableSpan<float3> translations = tls.translations;
+        smooth::surface_smooth_displace_step(
+            laplacian_disp, average_laplacian_disps, preserve_form_beta, translations);
+        scale_translations(translations, node_factors);
+
+        clip_and_lock_translations(sd, ss, position_data.eval, verts, translations);
+        position_data.deform(translations, verts);
+      },
+      exec_mode::grain_size(1));
+}
+
+static void calc_grids_preserve_form(const Depsgraph &depsgraph,
+                                     const Sculpt &sd,
+                                     const OffsetIndices<int> faces,
+                                     const Span<int> corner_verts,
+                                     const BitSpan boundary_verts,
+                                     const Set<OrderedEdge> &boundary_edges,
+                                     Object &object,
+                                     const Brush &brush,
+                                     const float strength,
+                                     const bke::pbvh::GridsNode &node,
+                                     const MutableSpan<float3> all_laplacian_disp,
+                                     LocalData &tls)
+{
+  SculptSession &ss = *object.runtime->sculpt_session;
+  SubdivCCG &subdiv_ccg = *ss.subdiv_ccg;
+
+  const Span<int> grids = node.grids();
+  const MutableSpan positions = gather_grids_positions(subdiv_ccg, grids, tls.positions);
+
+  calc_factors_common_grids(depsgraph, brush, object, positions, node, tls.factors, tls.distances);
+  scale_factors(tls.factors, strength);
+
+  const OrigPositionData orig_data = orig_position_data_get_grids(object, node);
+  tls.average_positions.resize(positions.size());
+  const MutableSpan<float3> average_positions = tls.average_positions;
+  smooth::neighbor_position_average_interior_grids(faces,
+                                                   corner_verts,
+                                                   boundary_verts,
+                                                   boundary_edges,
+                                                   subdiv_ccg,
+                                                   grids,
+                                                   tls.factors,
+                                                   average_positions);
+
+  tls.laplacian_disp.resize(positions.size());
+  const MutableSpan<float3> laplacian_disp = tls.laplacian_disp;
+  tls.translations.resize(positions.size());
+  const MutableSpan<float3> translations = tls.translations;
+  smooth::surface_smooth_laplacian_step(positions,
+                                        orig_data.positions,
+                                        average_positions,
+                                        preserve_form_alpha,
+                                        laplacian_disp,
+                                        translations);
+  scale_translations(translations, tls.factors);
+
+  scatter_data_grids(subdiv_ccg, laplacian_disp.as_span(), grids, all_laplacian_disp);
+
+  clip_and_lock_translations(sd, ss, positions, translations);
+  apply_translations(translations, grids, subdiv_ccg);
+
+  const MutableSpan<float3> gathered_laplacian_disp = gather_data_grids(
+      subdiv_ccg, all_laplacian_disp.as_span(), grids, tls.laplacian_disp);
+  tls.average_positions.resize(positions.size());
+  const MutableSpan<float3> average_laplacian_disps = tls.average_positions;
+  smooth::average_data_grids(subdiv_ccg, all_laplacian_disp.as_span(), grids, average_laplacian_disps);
+
+  tls.translations.resize(positions.size());
+  const MutableSpan<float3> displace_translations = tls.translations;
+  smooth::surface_smooth_displace_step(gathered_laplacian_disp,
+                                       average_laplacian_disps,
+                                       preserve_form_beta,
+                                       displace_translations);
+  scale_translations(displace_translations, tls.factors);
+
+  clip_and_lock_translations(sd, ss, positions, displace_translations);
+  apply_translations(displace_translations, grids, subdiv_ccg);
+}
+
+static void calc_bmesh_preserve_form(const Depsgraph &depsgraph,
+                                     const Sculpt &sd,
+                                     Object &object,
+                                     const Brush &brush,
+                                     const float strength,
+                                     const MutableSpan<float3> all_laplacian_disp,
+                                     bke::pbvh::BMeshNode &node,
+                                     LocalData &tls)
+{
+  SculptSession &ss = *object.runtime->sculpt_session;
+
+  const Set<BMVert *, 0> &verts = BKE_pbvh_bmesh_node_unique_verts(&node);
+  const MutableSpan positions = gather_bmesh_positions(verts, tls.positions);
+
+  calc_factors_common_bmesh(depsgraph, brush, object, positions, node, tls.factors, tls.distances);
+  scale_factors(tls.factors, strength);
+
+  tls.average_positions.resize(verts.size());
+  const MutableSpan<float3> average_positions = tls.average_positions;
+  smooth::neighbor_position_average_interior_bmesh(verts, tls.factors, average_positions);
+
+  Array<float3> orig_positions(verts.size());
+  Array<float3> orig_normals(verts.size());
+  orig_position_data_gather_bmesh(*ss.bm_log, verts, orig_positions, orig_normals);
+
+  tls.laplacian_disp.resize(verts.size());
+  const MutableSpan<float3> laplacian_disp = tls.laplacian_disp;
+  tls.translations.resize(verts.size());
+  const MutableSpan<float3> translations = tls.translations;
+  smooth::surface_smooth_laplacian_step(positions,
+                                        orig_positions,
+                                        average_positions,
+                                        preserve_form_alpha,
+                                        laplacian_disp,
+                                        translations);
+  scale_translations(translations, tls.factors);
+
+  scatter_data_bmesh(laplacian_disp.as_span(), verts, all_laplacian_disp);
+
+  clip_and_lock_translations(sd, ss, positions, translations);
+  apply_translations(translations, verts);
+
+  const MutableSpan<float3> gathered_laplacian_disp = gather_data_bmesh(
+      all_laplacian_disp.as_span(), verts, tls.laplacian_disp);
+  tls.average_positions.resize(verts.size());
+  const MutableSpan<float3> average_laplacian_disps = tls.average_positions;
+  smooth::average_data_bmesh(all_laplacian_disp.as_span(), verts, average_laplacian_disps);
+
+  tls.translations.resize(verts.size());
+  const MutableSpan<float3> displace_translations = tls.translations;
+  smooth::surface_smooth_displace_step(gathered_laplacian_disp,
+                                       average_laplacian_disps,
+                                       preserve_form_beta,
+                                       displace_translations);
+  scale_translations(displace_translations, tls.factors);
+
+  clip_and_lock_translations(sd, ss, positions, displace_translations);
+  apply_translations(displace_translations, verts);
+}
+
 }  // namespace smooth_cc
 
 void do_smooth_brush(const Depsgraph &depsgraph,
@@ -290,6 +542,79 @@ void do_smooth_brush(const Depsgraph &depsgraph,
             },
             exec_mode::grain_size(1));
       }
+      break;
+    }
+  }
+  pbvh.tag_positions_changed(node_mask);
+  pbvh.update_bounds(depsgraph, object);
+}
+
+void do_smooth_brush_preserve_form(const Depsgraph &depsgraph,
+                                   const Sculpt &sd,
+                                   Object &object,
+                                   const IndexMask &node_mask,
+                                   const float brush_strength)
+{
+  SculptSession &ss = *object.runtime->sculpt_session;
+  bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
+  const Brush &brush = *BKE_paint_brush_for_read(&sd.paint);
+
+  boundary::ensure_boundary_info(object);
+
+  if (ss.cache->surface_smooth_laplacian_disp.is_empty()) {
+    BLI_assert_msg(stroke_is_first_brush_step(*ss.cache),
+                   "Should only be allocated on the first step");
+    ss.cache->surface_smooth_laplacian_disp = Array<float3>(vertex_count_get(object), float3(0));
+  }
+
+  switch (pbvh.type()) {
+    case bke::pbvh::Type::Mesh:
+      do_smooth_brush_preserve_form_mesh(
+          depsgraph, sd, brush, object, node_mask, brush_strength);
+      break;
+    case bke::pbvh::Type::Grids: {
+      const Mesh &base_mesh = *id_cast<const Mesh *>(object.data);
+      const OffsetIndices faces = base_mesh.faces();
+      const Span<int> corner_verts = base_mesh.corner_verts();
+
+      threading::EnumerableThreadSpecific<LocalData> all_tls;
+      MutableSpan<bke::pbvh::GridsNode> nodes = pbvh.nodes<bke::pbvh::GridsNode>();
+      node_mask.foreach_index(
+          [&](const int i) {
+            LocalData &tls = all_tls.local();
+            calc_grids_preserve_form(depsgraph,
+                                     sd,
+                                     faces,
+                                     corner_verts,
+                                     ss.boundary_info_cache->verts,
+                                     ss.boundary_info_cache->edges,
+                                     object,
+                                     brush,
+                                     brush_strength,
+                                     nodes[i],
+                                     ss.cache->surface_smooth_laplacian_disp,
+                                     tls);
+          },
+          exec_mode::grain_size(1));
+      break;
+    }
+    case bke::pbvh::Type::BMesh: {
+      vert_random_access_ensure(object);
+      threading::EnumerableThreadSpecific<LocalData> all_tls;
+      MutableSpan<bke::pbvh::BMeshNode> nodes = pbvh.nodes<bke::pbvh::BMeshNode>();
+      node_mask.foreach_index(
+          [&](const int i) {
+            LocalData &tls = all_tls.local();
+            calc_bmesh_preserve_form(depsgraph,
+                                     sd,
+                                     object,
+                                     brush,
+                                     brush_strength,
+                                     ss.cache->surface_smooth_laplacian_disp,
+                                     nodes[i],
+                                     tls);
+          },
+          exec_mode::grain_size(1));
       break;
     }
   }
