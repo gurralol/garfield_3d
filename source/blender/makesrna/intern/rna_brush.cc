@@ -2540,6 +2540,11 @@ static void rna_def_brush(BlenderRNA *brna)
        0,
        "Surface",
        "Smooths the surface of the mesh, preserving the volume"},
+      {BRUSH_SMOOTH_DEFORM_MULTISCALE,
+       "MULTISCALE",
+       0,
+       "Multiscale",
+       "Smooths across a broader area based on brush radius while preserving form"},
       {0, nullptr, 0, nullptr, nullptr},
   };
 

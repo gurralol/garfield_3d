@@ -12,6 +12,7 @@
 #include "BLI_offset_indices.hh"
 #include "BLI_ordered_edge.hh"
 #include "BLI_set.hh"
+#include "BLI_vector.hh"
 
 #include "BKE_subdiv_ccg.hh"
 
@@ -64,6 +65,31 @@ void neighbor_position_average_interior_bmesh(const Set<BMVert *, 0> &verts,
                                               MutableSpan<float3> new_positions);
 void neighbor_position_average_interior_bmesh(const Set<BMVert *, 0> &verts,
                                               MutableSpan<float3> new_positions);
+
+void blur_positions_mesh(Span<float3> all_positions,
+                         Span<int> verts,
+                         GroupedSpan<int> vert_neighbors,
+                         Span<float> factors,
+                         int iterations,
+                         Span<float3> current_positions,
+                         MutableSpan<float3> result_positions,
+                         MutableSpan<float3> buffer);
+void blur_positions_grids(const CCGKey &key,
+                          Span<float3> all_positions,
+                          Span<int> vert_indices,
+                          Span<Vector<SubdivCCGCoord>> neighbors,
+                          Span<float> factors,
+                          int iterations,
+                          Span<float3> current_positions,
+                          MutableSpan<float3> result_positions,
+                          MutableSpan<float3> buffer);
+void blur_positions_bmesh(Span<int> vert_indices,
+                          Span<Vector<BMVert *>> neighbors,
+                          Span<float> factors,
+                          int iterations,
+                          Span<float3> current_positions,
+                          MutableSpan<float3> result_positions,
+                          MutableSpan<float3> buffer);
 
 template<typename T>
 void neighbor_data_average_mesh(Span<T> src, GroupedSpan<int> vert_neighbors, MutableSpan<T> dst);

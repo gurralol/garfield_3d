@@ -190,12 +190,12 @@ void do_smooth_brush(const Depsgraph &depsgraph,
                      Object &object,
                      const IndexMask &node_mask,
                      float brush_strength);
-/** Smooth positions while preserving more of the original form. */
-void do_smooth_brush_preserve_form(const Depsgraph &depsgraph,
-                                   const Sculpt &sd,
-                                   Object &object,
-                                   const IndexMask &node_mask,
-                                   float brush_strength);
+/** Smooth positions across a broader area while preserving more of the original form. */
+void do_smooth_brush_multiscale(const Depsgraph &depsgraph,
+                                const Sculpt &sd,
+                                Object &object,
+                                const IndexMask &node_mask,
+                                float brush_strength);
 /** Smooth mask values with neighboring vertices. */
 void do_smooth_mask_brush(const Depsgraph &depsgraph,
                           const Sculpt &sd,

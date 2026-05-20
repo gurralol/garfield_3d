@@ -185,6 +185,7 @@ enum eBrushClothDeformType : int {
 enum eBrushSmoothDeformType : int {
   BRUSH_SMOOTH_DEFORM_LAPLACIAN = 0,
   BRUSH_SMOOTH_DEFORM_SURFACE = 1,
+  BRUSH_SMOOTH_DEFORM_MULTISCALE = 2,
 };
 
 enum eBrushClothForceFalloffType : int {

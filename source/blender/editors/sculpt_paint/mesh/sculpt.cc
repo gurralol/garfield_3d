@@ -922,9 +922,18 @@ static bool brush_type_needs_original(const char sculpt_brush_type)
               SCULPT_BRUSH_TYPE_LAYER,
               SCULPT_BRUSH_TYPE_DRAW_SHARP,
               SCULPT_BRUSH_TYPE_ELASTIC_DEFORM,
-              SCULPT_BRUSH_TYPE_SMOOTH,
               SCULPT_BRUSH_TYPE_BOUNDARY,
               SCULPT_BRUSH_TYPE_POSE);
+}
+
+static bool brush_needs_original(const Brush &brush)
+{
+  if (brush.sculpt_brush_type == SCULPT_BRUSH_TYPE_SMOOTH &&
+      brush.smooth_deform_type == BRUSH_SMOOTH_DEFORM_MULTISCALE)
+  {
+    return false;
+  }
+  return brush_type_needs_original(brush.sculpt_brush_type);
 }
 
 static bool brush_uses_topology_rake(const SculptSession &ss, const Brush &brush)
@@ -3145,8 +3154,7 @@ static void dynamic_topology_update(const Depsgraph &depsgraph,
   bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(ob);
 
   /* Build a list of all nodes that are potentially within the brush's area of influence. */
-  const bool use_original = brush_type_needs_original(brush.sculpt_brush_type) ? true :
-                                                                                 !ss.cache->accum;
+  const bool use_original = brush_needs_original(brush) ? true : !ss.cache->accum;
   constexpr float radius_scale = 1.25f;
 
   IndexMaskMemory memory;
@@ -3256,8 +3264,7 @@ static brushes::CursorSampleResult calc_brush_node_mask(const Depsgraph &depsgra
   const SculptSession &ss = *ob.runtime->sculpt_session;
   const bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(ob);
 
-  const bool use_original = brush_type_needs_original(brush.sculpt_brush_type) ? true :
-                                                                                 !ss.cache->accum;
+  const bool use_original = brush_needs_original(brush) ? true : !ss.cache->accum;
   /* Build a list of all nodes that are potentially within the brush's area of influence */
 
   if (brush_type_needs_all_pbvh_nodes(brush)) {
@@ -3333,8 +3340,7 @@ static void do_brush_action(const Depsgraph &depsgraph,
   IndexMaskMemory memory;
   IndexMask texnode_mask;
 
-  const bool use_original = brush_type_needs_original(brush.sculpt_brush_type) ? true :
-                                                                                 !ss.cache->accum;
+  const bool use_original = brush_needs_original(brush) ? true : !ss.cache->accum;
   const bool use_pixels = sculpt_needs_pbvh_pixels(brush, ob);
 
   if (sculpt_needs_pbvh_pixels(brush, ob)) {
@@ -3422,12 +3428,26 @@ static void do_brush_action(const Depsgraph &depsgraph,
           brushes::do_enhance_details_brush(depsgraph, sd, ob, node_mask);
         }
         else {
-          brushes::do_smooth_brush_preserve_form(
+          brushes::do_smooth_brush(
               depsgraph, sd, ob, node_mask, std::clamp(ss.cache->bstrength, 0.0f, 1.0f));
         }
       }
       else if (brush.smooth_deform_type == BRUSH_SMOOTH_DEFORM_SURFACE) {
         brushes::do_surface_smooth_brush(depsgraph, sd, ob, node_mask);
+      }
+      else if (brush.smooth_deform_type == BRUSH_SMOOTH_DEFORM_MULTISCALE) {
+        /* NOTE: The enhance brush needs to initialize its state on the first brush step. The
+         * stroke strength can become 0 during the stroke, but it can not change sign (the sign is
+         * determined in the beginning of the stroke. So here it is important to not switch to
+         * enhance brush in the middle of the stroke. */
+        if (ss.cache->initial_direction_flipped) {
+          /* Invert mode, intensify details. */
+          brushes::do_enhance_details_brush(depsgraph, sd, ob, node_mask);
+        }
+        else {
+          brushes::do_smooth_brush_multiscale(
+              depsgraph, sd, ob, node_mask, std::clamp(ss.cache->bstrength, 0.0f, 1.0f));
+        }
       }
       break;
     case SCULPT_BRUSH_TYPE_CREASE:
@@ -5758,6 +5778,12 @@ void SculptPaintStroke::stroke_cache_init(const float mval[2])
         cache->accum = true;
       }
     }
+  }
+
+  if (brush->sculpt_brush_type == SCULPT_BRUSH_TYPE_SMOOTH &&
+      brush->smooth_deform_type == BRUSH_SMOOTH_DEFORM_MULTISCALE)
+  {
+    cache->accum = true;
   }
 
   /* Original coordinates require the sculpt undo system, which isn't used

@@ -8,6 +8,7 @@
 #include "sculpt_smooth.hh"
 
 #include "BLI_enumerable_thread_specific.hh"
+#include "BLI_map.hh"
 #include "BLI_math_base.hh"
 #include "BLI_math_geom.h"
 #include "BLI_math_vector.h"
@@ -337,6 +338,167 @@ void neighbor_position_average_interior_bmesh(const Set<BMVert *, 0> &verts,
                                               const MutableSpan<float3> new_positions)
 {
   neighbor_position_average_interior_bmesh_impl<false>(verts, {}, new_positions);
+}
+
+void blur_positions_mesh(const Span<float3> all_positions,
+                         const Span<int> verts,
+                         const GroupedSpan<int> vert_neighbors,
+                         const Span<float> factors,
+                         const int iterations,
+                         const Span<float3> current_positions,
+                         const MutableSpan<float3> result_positions,
+                         const MutableSpan<float3> buffer)
+{
+  BLI_assert(verts.size() == vert_neighbors.size());
+  BLI_assert(verts.size() == factors.size());
+  BLI_assert(verts.size() == current_positions.size());
+  BLI_assert(verts.size() == result_positions.size());
+  BLI_assert(verts.size() == buffer.size());
+
+  Map<int, int> local_vert_indices;
+  local_vert_indices.reserve(verts.size());
+  for (const int i : verts.index_range()) {
+    local_vert_indices.add_new(verts[i], i);
+    result_positions[i] = current_positions[i];
+  }
+
+  MutableSpan<float3> src = result_positions;
+  MutableSpan<float3> dst = buffer;
+  for ([[maybe_unused]] const int _ : IndexRange(iterations)) {
+    for (const int i : verts.index_range()) {
+      if (factors[i] == 0.0f || vert_neighbors[i].is_empty()) {
+        dst[i] = src[i];
+        continue;
+      }
+
+      float3 average(0);
+      const float factor = math::rcp(float(vert_neighbors[i].size()));
+      for (const int neighbor : vert_neighbors[i]) {
+        if (const int *local_index = local_vert_indices.lookup_ptr(neighbor)) {
+          average += src[*local_index] * factor;
+        }
+        else {
+          average += all_positions[neighbor] * factor;
+        }
+      }
+      dst[i] = average;
+    }
+    std::swap(src, dst);
+  }
+
+  if (src.data() != result_positions.data()) {
+    for (const int i : result_positions.index_range()) {
+      result_positions[i] = src[i];
+    }
+  }
+}
+
+void blur_positions_grids(const CCGKey &key,
+                          const Span<float3> all_positions,
+                          const Span<int> vert_indices,
+                          const Span<Vector<SubdivCCGCoord>> neighbors,
+                          const Span<float> factors,
+                          const int iterations,
+                          const Span<float3> current_positions,
+                          const MutableSpan<float3> result_positions,
+                          const MutableSpan<float3> buffer)
+{
+  BLI_assert(vert_indices.size() == neighbors.size());
+  BLI_assert(vert_indices.size() == factors.size());
+  BLI_assert(vert_indices.size() == current_positions.size());
+  BLI_assert(vert_indices.size() == result_positions.size());
+  BLI_assert(vert_indices.size() == buffer.size());
+
+  Map<int, int> local_vert_indices;
+  local_vert_indices.reserve(vert_indices.size());
+  for (const int i : vert_indices.index_range()) {
+    local_vert_indices.add_new(vert_indices[i], i);
+    result_positions[i] = current_positions[i];
+  }
+
+  MutableSpan<float3> src = result_positions;
+  MutableSpan<float3> dst = buffer;
+  for ([[maybe_unused]] const int _ : IndexRange(iterations)) {
+    for (const int i : vert_indices.index_range()) {
+      if (factors[i] == 0.0f || neighbors[i].is_empty()) {
+        dst[i] = src[i];
+        continue;
+      }
+
+      float3 average(0);
+      const float factor = math::rcp(float(neighbors[i].size()));
+      for (const SubdivCCGCoord &neighbor : neighbors[i]) {
+        const int neighbor_index = neighbor.to_index(key);
+        if (const int *local_index = local_vert_indices.lookup_ptr(neighbor_index)) {
+          average += src[*local_index] * factor;
+        }
+        else {
+          average += all_positions[neighbor_index] * factor;
+        }
+      }
+      dst[i] = average;
+    }
+    std::swap(src, dst);
+  }
+
+  if (src.data() != result_positions.data()) {
+    for (const int i : result_positions.index_range()) {
+      result_positions[i] = src[i];
+    }
+  }
+}
+
+void blur_positions_bmesh(const Span<int> vert_indices,
+                          const Span<Vector<BMVert *>> neighbors,
+                          const Span<float> factors,
+                          const int iterations,
+                          const Span<float3> current_positions,
+                          const MutableSpan<float3> result_positions,
+                          const MutableSpan<float3> buffer)
+{
+  BLI_assert(vert_indices.size() == neighbors.size());
+  BLI_assert(vert_indices.size() == factors.size());
+  BLI_assert(vert_indices.size() == current_positions.size());
+  BLI_assert(vert_indices.size() == result_positions.size());
+  BLI_assert(vert_indices.size() == buffer.size());
+
+  Map<int, int> local_vert_indices;
+  local_vert_indices.reserve(vert_indices.size());
+  for (const int i : vert_indices.index_range()) {
+    local_vert_indices.add_new(vert_indices[i], i);
+    result_positions[i] = current_positions[i];
+  }
+
+  MutableSpan<float3> src = result_positions;
+  MutableSpan<float3> dst = buffer;
+  for ([[maybe_unused]] const int _ : IndexRange(iterations)) {
+    for (const int i : vert_indices.index_range()) {
+      if (factors[i] == 0.0f || neighbors[i].is_empty()) {
+        dst[i] = src[i];
+        continue;
+      }
+
+      float3 average(0);
+      const float factor = math::rcp(float(neighbors[i].size()));
+      for (const BMVert *neighbor : neighbors[i]) {
+        const int neighbor_index = BM_elem_index_get(neighbor);
+        if (const int *local_index = local_vert_indices.lookup_ptr(neighbor_index)) {
+          average += src[*local_index] * factor;
+        }
+        else {
+          average += float3(neighbor->co) * factor;
+        }
+      }
+      dst[i] = average;
+    }
+    std::swap(src, dst);
+  }
+
+  if (src.data() != result_positions.data()) {
+    for (const int i : result_positions.index_range()) {
+      result_positions[i] = src[i];
+    }
+  }
 }
 
 void bmesh_four_neighbor_average(float avg[3], const float3 &direction, const BMVert *v)
