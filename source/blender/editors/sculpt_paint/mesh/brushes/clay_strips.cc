@@ -11,7 +11,7 @@
  *
  * The magnitude of the displacement is determined by the product of the following factors:
  * - A falloff factor based on the XY distance from the center of the plane
- * - A parabolic falloff factor based on the local Z distance from the plane
+ * - A clamped local Z distance factor that scales displacement toward the brush plane
  * - Additional standard modifiers such as masking, brush strength, texture masking, etc.
  */
 
@@ -92,20 +92,30 @@ static void calc_local_positions(const Span<float3> positions,
 }
 
 /**
- * Applies a parabolic factor of the form `z * (1 - z)` to each vertex.
- * Vertices outside of the interval (0, 1) are out of range and their factors are set to zero.
- * Note: The local coordinate system is constructed such that all relevant `z` values
- * are non-negative.
+ * Clay Strips only affects vertices below the brush plane. In local brush space those vertices
+ * have positive z values, so discard the rest here and keep the local depth available to scale the
+ * final displacement toward the plane later.
  */
-static void apply_z_axis_factors(const Span<float> z_positions, const MutableSpan<float> factors)
+static void apply_z_axis_clipping_factors(const Span<float> z_positions,
+                                          const MutableSpan<float> factors)
 {
   BLI_assert(factors.size() == z_positions.size());
 
   for (const int i : factors.index_range()) {
     const float local_z = z_positions[i];
+    if (local_z <= 0.0f) {
+      factors[i] = 0.0f;
+    }
+  }
+}
 
-    /* Note: if `local_z > 1`, then `1 - local_z < 0` and the product is negative. */
-    factors[i] *= math::max(0.0f, local_z * (1.0f - local_z));
+static void scale_factors_by_local_depth(const Span<float> z_positions,
+                                         const MutableSpan<float> factors)
+{
+  BLI_assert(factors.size() == z_positions.size());
+
+  for (const int i : factors.index_range()) {
+    factors[i] *= math::max(0.0f, z_positions[i]);
   }
 }
 
@@ -162,7 +172,7 @@ static void calc_faces(const Depsgraph &depsgraph,
   MutableSpan<float> z_positions = tls.z_positions;
 
   calc_local_positions(position_data.eval, verts, mat, xy_positions, z_positions);
-  apply_z_axis_factors(z_positions, factors);
+  apply_z_axis_clipping_factors(z_positions, factors);
   apply_plane_trim_factors(brush, z_positions, factors);
 
   tls.distances.resize(verts.size());
@@ -179,6 +189,7 @@ static void calc_faces(const Depsgraph &depsgraph,
   auto_mask::calc_vert_factors(depsgraph, object, cache.automasking.get(), node, verts, factors);
 
   calc_brush_texture_factors(ss, brush, position_data.eval, verts, factors);
+  scale_factors_by_local_depth(z_positions, factors);
 
   tls.translations.resize(verts.size());
   translations_from_offset_and_factors(offset, factors, tls.translations);
@@ -217,7 +228,7 @@ static void calc_grids(const Depsgraph &depsgraph,
   MutableSpan<float> z_positions = tls.z_positions;
 
   calc_local_positions(positions, mat, xy_positions, z_positions);
-  apply_z_axis_factors(z_positions, factors);
+  apply_z_axis_clipping_factors(z_positions, factors);
   apply_plane_trim_factors(brush, z_positions, factors);
 
   tls.distances.resize(positions.size());
@@ -234,6 +245,7 @@ static void calc_grids(const Depsgraph &depsgraph,
   auto_mask::calc_grids_factors(depsgraph, object, cache.automasking.get(), node, grids, factors);
 
   calc_brush_texture_factors(ss, brush, positions, factors);
+  scale_factors_by_local_depth(z_positions, factors);
 
   tls.translations.resize(positions.size());
   translations_from_offset_and_factors(offset, factors, tls.translations);
@@ -271,7 +283,7 @@ static void calc_bmesh(const Depsgraph &depsgraph,
   MutableSpan<float> z_positions = tls.z_positions;
 
   calc_local_positions(positions, mat, xy_positions, z_positions);
-  apply_z_axis_factors(z_positions, factors);
+  apply_z_axis_clipping_factors(z_positions, factors);
   apply_plane_trim_factors(brush, z_positions, factors);
 
   tls.distances.resize(positions.size());
@@ -288,6 +300,7 @@ static void calc_bmesh(const Depsgraph &depsgraph,
   auto_mask::calc_vert_factors(depsgraph, object, cache.automasking.get(), node, verts, factors);
 
   calc_brush_texture_factors(ss, brush, positions, factors);
+  scale_factors_by_local_depth(z_positions, factors);
 
   tls.translations.resize(positions.size());
   translations_from_offset_and_factors(offset, factors, tls.translations);
