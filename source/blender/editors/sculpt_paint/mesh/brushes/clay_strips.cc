@@ -102,10 +102,13 @@ static void apply_z_axis_factors(const Span<float> z_positions, const MutableSpa
   BLI_assert(factors.size() == z_positions.size());
 
   for (const int i : factors.index_range()) {
-    const float local_z = z_positions[i];
+    float local_z = z_positions[i];
 
-    /* Note: if `local_z > 1`, then `1 - local_z < 0` and the product is negative. */
-    factors[i] *= math::max(0.0f, local_z * (1.0f - local_z));
+    if (local_z < 0.0f || local_z > 1.0f) {
+      local_z = 0.0f;
+    }
+    
+    factors[i] *= local_z;
   }
 }
 
